@@ -1,0 +1,13 @@
+/* The SafeTails design system lives in src/safetails/styles.css (the single
+   source of visual truth, ported verbatim from the design reference).
+   Keep this file minimal so nothing overrides the design tokens. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+#__next {
+  height: 100%;
+}
