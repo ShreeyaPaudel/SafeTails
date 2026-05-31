@@ -1,0 +1,28 @@
+# ML training / evaluation environment. Target: Python 3.10–3.12.
+# Install in a SEPARATE venv from the backend (heavier deps).
+# For CUDA builds of torch, follow https://pytorch.org/get-started/locally/
+
+torch==2.3.1
+torchvision==0.18.1
+onnx==1.16.1
+onnxruntime==1.18.1
+
+numpy==1.26.4
+pandas==2.2.2
+pillow==10.4.0
+scikit-learn==1.5.1
+albumentations==1.4.12
+imagehash==4.3.1
+
+# Dataset acquisition (public datasets via the Hugging Face Hub)
+datasets==2.20.0
+huggingface_hub==0.24.5
+
+matplotlib>=3.8,<4
+seaborn>=0.13,<0.14
+
+jupyter==1.0.0
+nbconvert==7.16.4
+tqdm==4.66.4
+# Experiment tracking (optional) — omitted to keep the install wheels-only on Windows.
+# wandb==0.17.5
