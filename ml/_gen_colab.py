@@ -1,0 +1,593 @@
+"""Generate notebooks/03_colab_train_species.ipynb — a self-contained Google Colab notebook that
+retrains the SafeTails species classifier with stronger datasets / architectures / tuning, and
+exports an ONNX model + labels.json + calibration.json that drop straight into ml/exported/.
+
+Run locally with the ml venv:  py -3.11 ml/_gen_colab.py
+Then open the notebook in Colab (Runtime > GPU).  Stays within the 5-class thesis taxonomy.
+"""
+import nbformat as nbf
+from pathlib import Path
+
+NB = Path("notebooks")
+NB.mkdir(exist_ok=True)
+nb = nbf.v4.new_notebook()
+md = nbf.v4.new_markdown_cell
+code = nbf.v4.new_code_cell
+cells = []
+
+cells.append(md(
+    "# SafeTails — Species Classifier: Colab Pro Training & Export\n"
+    "\n"
+    "Retrains the **only in-house model** (5-class species classifier) with modern, widely-adopted "
+    "datasets and architectures, then exports artefacts that drop straight into `ml/exported/`.\n"
+    "\n"
+    "**Taxonomy (unchanged, thesis scope):** `Dog, Cat, Cow, Buffalo, Other`.\n"
+    "\n"
+    "**Upgrades vs the baseline**\n"
+    "- Datasets: **Oxford-IIIT Pet** (cat/dog) + **Stanford Dogs**, **regional Indian/Pakistani "
+    "cattle & buffalo** (Kaggle - fixes the Nepal domain gap on the two weakest classes) + "
+    "**Animals-10** for *Other*; ImageNet synsets remain a fallback top-up.\n"
+    "- Backbones: **EfficientNetV2-S** and **ConvNeXt-Tiny** (vs MobileNetV3 / EfficientNet-B0 baseline).\n"
+    "- Training: RandAugment + Random Erasing + **MixUp/CutMix**, label smoothing, cosine LR, **EMA**, AMP.\n"
+    "- **Optuna** hyper-parameter search, temperature-scaling **calibration** (ECE), full evaluation.\n"
+    "- ONNX export (opset 17) with the **exact preprocessing the backend uses** (Resize 224 + ImageNet norm).\n"
+    "\n"
+    "> Runtime → Change runtime type → **GPU** (T4/A100). `SEED=42` throughout for reproducibility."
+))
+
+cells.append(md("## 1 · Setup"))
+cells.append(code(
+    "!pip -q install onnx onnxruntime timm optuna scikit-learn seaborn datasets huggingface_hub pillow --upgrade\n"
+    "import torch, torchvision, platform\n"
+    "print('torch', torch.__version__, '| torchvision', torchvision.__version__)\n"
+    "print('CUDA available:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')\n"
+    "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'"
+))
+cells.append(code(
+    "import os, random, numpy as np, torch\n"
+    "SEED = 42\n"
+    "def set_seed(s=SEED):\n"
+    "    random.seed(s); os.environ['PYTHONHASHSEED']=str(s); np.random.seed(s)\n"
+    "    torch.manual_seed(s); torch.cuda.manual_seed_all(s)\n"
+    "set_seed()\n"
+    "\n"
+    "CLASS_NAMES = ['Dog', 'Cat', 'Cow', 'Buffalo', 'Other']   # order MUST match the backend\n"
+    "IMG_SIZE = 224\n"
+    "PER_CLASS = 2500           # collect generously per class; class-balanced sampling handles any\n"
+    "                           # remaining imbalance during training. Lower to ~1200 for a fast run,\n"
+    "                           # raise to 4000+ on an A100 for the strongest model.\n"
+    "SPLIT = (0.70, 0.15, 0.15) # train / val / test, stratified\n"
+    "from pathlib import Path\n"
+    "RAW = Path('data/raw'); RAW.mkdir(parents=True, exist_ok=True)\n"
+    "EXPORT = Path('exported'); EXPORT.mkdir(exist_ok=True)\n"
+    "IMAGENET_MEAN=[0.485,0.456,0.406]; IMAGENET_STD=[0.229,0.224,0.225]"
+))
+
+cells.append(md(
+    "## 2 · Acquire datasets → `data/raw/<Class>/`\n"
+    "Each class is filled from standard public sources, capped for balance. Failures on any one "
+    "source are skipped so acquisition is robust."
+))
+cells.append(code(
+    "import io, requests\n"
+    "from PIL import Image\n"
+    "\n"
+    "def _save(img, cls, i, max_side=512):\n"
+    "    try:\n"
+    "        img = img.convert('RGB')\n"
+    "        if max(img.size) > max_side: img.thumbnail((max_side, max_side))\n"
+    "        d = RAW/cls; d.mkdir(parents=True, exist_ok=True)\n"
+    "        img.save(d/f'{cls.lower()}_{i:05d}.jpg', 'JPEG', quality=90); return True\n"
+    "    except Exception: return False\n"
+    "\n"
+    "def count(cls): return len(list((RAW/cls).glob('*.jpg')))"
+))
+cells.append(code(
+    "# --- Cat & Dog: Oxford-IIIT Pet (torchvision downloads it) -----------------\n"
+    "from torchvision.datasets import OxfordIIITPet\n"
+    "pet = OxfordIIITPet(root='oxford_pet', download=True, target_types='binary-category')\n"
+    "# binary-category: 0 = cat, 1 = dog\n"
+    "ci = {0:'Cat', 1:'Dog'}; seen={'Cat':count('Cat'),'Dog':count('Dog')}\n"
+    "for img, y in pet:\n"
+    "    cls = ci[int(y)]\n"
+    "    if seen[cls] >= PER_CLASS: \n"
+    "        if seen['Cat']>=PER_CLASS and seen['Dog']>=PER_CLASS: break\n"
+    "        continue\n"
+    "    if _save(img, cls, seen[cls]): seen[cls]+=1\n"
+    "print('Oxford Pet ->', {k:count(k) for k in ['Cat','Dog']})"
+))
+cells.append(code(
+    "# --- More dogs: Stanford Dogs (HF) for breed variety (optional, skipped on failure) ---\n"
+    "from datasets import load_dataset\n"
+    "def fill_from_hf(cls, dataset_id, image_col=None, label_filter=None, cap=PER_CLASS):\n"
+    "    try:\n"
+    "        ds = load_dataset(dataset_id, split='train', streaming=True)\n"
+    "    except Exception as e:\n"
+    "        print('skip', dataset_id, '-', str(e)[:80]); return\n"
+    "    n = count(cls)\n"
+    "    icol = image_col\n"
+    "    for ex in ds:\n"
+    "        if n >= cap: break\n"
+    "        if icol is None:\n"
+    "            icol = next((k for k,v in ex.items() if hasattr(v,'convert') or (isinstance(v,dict) and 'bytes' in v)), None)\n"
+    "            if icol is None: break\n"
+    "        v = ex[icol]\n"
+    "        try:\n"
+    "            img = v if hasattr(v,'convert') else Image.open(io.BytesIO(v['bytes']))\n"
+    "        except Exception: continue\n"
+    "        if _save(img, cls, n): n += 1\n"
+    "    print(f'{cls} <- {dataset_id}: now {count(cls)}')\n"
+    "\n"
+    "fill_from_hf('Dog', 'Alanox/stanford-dogs')   # harmless if it fails; Oxford already gave us dogs"
+))
+cells.append(md(
+    "## 2c · Regional cattle & buffalo + Animals-10 (Kaggle) - the domain-gap upgrade\n"
+    "The baseline used generic ImageNet ox / water-buffalo, which don't match South-Asian animals. "
+    "These Kaggle datasets are **Indian/Pakistani breeds** (much better for Nepal, and they target "
+    "the two weakest classes) plus **Animals-10** for a rich *Other*. Upload your `kaggle.json` "
+    "(Kaggle -> Settings -> Create New API Token) when prompted."
+))
+cells.append(code(
+    "import os, subprocess, glob\n"
+    "KAGGLE_OK=False\n"
+    "try:\n"
+    "    if not os.path.exists('/root/.kaggle/kaggle.json'):\n"
+    "        from google.colab import files; up=files.upload()  # pick kaggle.json\n"
+    "        os.makedirs('/root/.kaggle', exist_ok=True)\n"
+    "        for fn in up:\n"
+    "            if fn.endswith('.json'): open('/root/.kaggle/kaggle.json','wb').write(up[fn])\n"
+    "        os.chmod('/root/.kaggle/kaggle.json', 0o600)\n"
+    "    subprocess.run(['pip','-q','install','kaggle'])\n"
+    "    KAGGLE_OK=os.path.exists('/root/.kaggle/kaggle.json'); print('Kaggle ready:', KAGGLE_OK)\n"
+    "except Exception as e:\n"
+    "    print('Kaggle not set up (', e, ') - will fall back to ImageNet synsets')"
+))
+cells.append(code(
+    "# Paste each dataset's Kaggle SLUG (the '<owner>/<name>' part of its kaggle.com/datasets URL).\n"
+    "#   fixed  -> the WHOLE dataset is one class\n"
+    "#   route  -> assign each image by the first keyword found in its file path\n"
+    "KAGGLE_SOURCES = [\n"
+    "    # Dog + Cat (ADDS to Oxford-IIIT Pet + Stanford Dogs, does not replace them):\n"
+    "    {'slug':'bhavikjikadara/dog-and-cat-classification-dataset', 'route':{'cat':'Cat','dog':'Dog'}},\n"
+    "    # Cow + Buffalo (regional South-Asian - the key domain-gap upgrade):\n"
+    "    {'slug':'raghavdharwal/cows-and-buffalo-computer-vision-dataset', 'route':{'buffalo':'Buffalo','cow':'Cow','cattle':'Cow'}},\n"
+    "    {'slug':'algsoch/breed-cattle-buffalo',        'route':'BREEDS'},   # 75 Indian breeds -> Cow/Buffalo\n"
+    "    {'slug':'atharvadarpude/indian-buffalo-dataset','fixed':'Buffalo'},\n"
+    "    # Other (also supplements Dog/Cat/Cow) - Animals-10 uses Italian folder names:\n"
+    "    {'slug':'alessiocorrado99/animals10',          'route':{'cane':'Dog','gatto':'Cat','mucca':'Cow',\n"
+    "        'pecora':'Other','gallina':'Other','cavallo':'Other','elefante':'Other','scoiattolo':'Other','farfalla':'Other','ragno':'Other'}},\n"
+    "    # Wild/zoo animals -> a richer, harder Other:\n"
+    "    {'slug':'jirkadaberger/zoo-animals',           'fixed':'Other'},\n"
+    "]\n"
+    "# Buffalo breeds (everything else in a mixed cattle+buffalo set is treated as Cow).\n"
+    "BUFFALO_BREEDS=['murrah','nili','ravi','kundi','jaffarabadi','surti','mehsana','bhadawari','banni','toda','pandharpuri','nagpuri','marathwadi','buffalo']\n"
+    "def _route_breeds(pl):\n"
+    "    return 'Buffalo' if any(b in pl for b in BUFFALO_BREEDS) else 'Cow'\n"
+    "\n"
+    "def ingest_kaggle(src):\n"
+    "    slug=src['slug']\n"
+    "    if '<owner>' in slug: print('skip (add the slug):', slug); return\n"
+    "    d=Path('kaggle')/slug.split('/')[-1]; d.mkdir(parents=True, exist_ok=True)\n"
+    "    if not any(d.iterdir()):\n"
+    "        if subprocess.run(['kaggle','datasets','download','-d',slug,'-p',str(d),'--unzip']).returncode!=0:\n"
+    "            print('download failed (check slug / accept dataset terms):', slug); return\n"
+    "    n={c:count(c) for c in CLASS_NAMES}; base=str(d).lower()\n"
+    "    for f in glob.glob(str(d/'**'/'*.*'), recursive=True):\n"
+    "        pl=f.lower()\n"
+    "        if not pl.endswith(('.jpg','.jpeg','.png')): continue\n"
+    "        rel=pl[len(base):]   # match INSIDE the dataset only (the folder name itself can contain 'buffalo'/'cat')\n"
+    "        if 'fixed' in src: cls=src['fixed']\n"
+    "        elif src.get('route')=='BREEDS': cls=_route_breeds(rel)\n"
+    "        else: cls=next((c for kw,c in src['route'].items() if kw in rel), None)\n"
+    "        if not cls or n[cls]>=PER_CLASS: continue\n"
+    "        try:\n"
+    "            if _save(Image.open(f), cls, n[cls]): n[cls]+=1\n"
+    "        except Exception: pass\n"
+    "    print(f'{slug}:', {c:count(c) for c in CLASS_NAMES})\n"
+    "\n"
+    "if KAGGLE_OK:\n"
+    "    for s in KAGGLE_SOURCES: ingest_kaggle(s)\n"
+    "else:\n"
+    "    print('Skipping Kaggle sources (no token).')"
+))
+cells.append(md(
+    "## 2d · Local datasets you downloaded (Mendeley / Roboflow / IEEE)\n"
+    "Drag the unzipped folder into Colab's **Files** panel (left), set its path + routing below. "
+    "(The HF `Rapidata/Animals-10` is the *same content* as the Kaggle Animals-10 already wired above, "
+    "so it's skipped to avoid duplicating the *Other* class.)"
+))
+cells.append(code(
+    "# Ingest an already-downloaded LOCAL folder tree. Same routing options as Kaggle:\n"
+    "#   fixed='Buffalo'  (whole folder is one class)\n"
+    "#   route={'buffalo':'Buffalo','cow':'Cow'}   (assign by keyword in the path)\n"
+    "#   route='BREEDS'   (buffalo-breed names -> Buffalo, else -> Cow)\n"
+    "def ingest_folder(root, fixed=None, route=None):\n"
+    "    root=Path(root)\n"
+    "    if not root.exists(): print('folder not found:', root, '- upload/unzip it first'); return\n"
+    "    n={c:count(c) for c in CLASS_NAMES}; base=str(root).lower()\n"
+    "    for f in glob.glob(str(root/'**'/'*.*'), recursive=True):\n"
+    "        pl=f.lower()\n"
+    "        if not pl.endswith(('.jpg','.jpeg','.png')): continue\n"
+    "        rel=pl[len(base):]\n"
+    "        if fixed: cls=fixed\n"
+    "        elif route=='BREEDS': cls=_route_breeds(rel)\n"
+    "        elif route: cls=next((c for kw,c in route.items() if kw in rel), None)\n"
+    "        else: cls=None\n"
+    "        if not cls or n[cls]>=PER_CLASS: continue\n"
+    "        try:\n"
+    "            if _save(Image.open(f), cls, n[cls]): n[cls]+=1\n"
+    "        except Exception: pass\n"
+    "    print('local', root.name, ':', {c: count(c) for c in CLASS_NAMES})\n"
+    "\n"
+    "# Mendeley vdgnxsm692 (data.mendeley.com/datasets/vdgnxsm692/2). Upload+unzip it, set the path,\n"
+    "# then pick the routing that matches its folders (inspect them once): fixed / route / 'BREEDS'.\n"
+    "MENDELEY_PATH = 'mendeley_vdgnxsm692'   # <- change to the unzipped folder's path in Colab\n"
+    "ingest_folder(MENDELEY_PATH, route={'buffalo':'Buffalo','cow':'Cow','cattle':'Cow'})\n"
+    "# For a Roboflow / IEEE export, drop the folder in and call ingest_folder('its_path', route=...)."
+))
+cells.append(code(
+    "# --- Fallback top-up from ImageNet synsets for any class still short (also the no-Kaggle path) ---\n"
+    "SYNSETS = {\n"
+    "  'Cow':     ['mlnomad/imnet1k_ox'],\n"
+    "  'Buffalo': ['mlnomad/imnet1k_water_buffalo_water_ox_Asiatic_buffalo_Bubalus_bubalis'],\n"
+    "  'Other':   ['mlnomad/imnet1k_ram_tup','mlnomad/imnet1k_hog_pig_grunter_squealer_Sus_scrofa',\n"
+    "              'mlnomad/imnet1k_macaque','mlnomad/imnet1k_hen','mlnomad/imnet1k_goose'],\n"
+    "}\n"
+    "for cls, ids in SYNSETS.items():\n"
+    "    for did in ids:\n"
+    "        if count(cls) >= PER_CLASS: break\n"
+    "        fill_from_hf(cls, did, cap=PER_CLASS)\n"
+    "print('final counts:', {c: count(c) for c in CLASS_NAMES})"
+))
+
+cells.append(md(
+    "## 2b · Exploratory data analysis (this dataset)\n"
+    "EDA on the *actual* data the v2 model trains on (different sources from notebook 01): class "
+    "balance, a labelled sample grid, and the image-size distribution. Figures are saved for the report."
+))
+cells.append(code(
+    "import matplotlib.pyplot as plt\n"
+    "from PIL import Image\n"
+    "FIG = EXPORT/'figures'; FIG.mkdir(parents=True, exist_ok=True)\n"
+    "counts = {c: count(c) for c in CLASS_NAMES}\n"
+    "fig,ax=plt.subplots(figsize=(6,3.2))\n"
+    "ax.bar(list(counts), list(counts.values()), color=['#3aa3b5','#e0a92e','#8a63d2','#b5651d','#5b8c5a'])\n"
+    "ax.set_title('Class balance (images per class)'); ax.set_ylabel('images')\n"
+    "for i,(k,v) in enumerate(counts.items()): ax.text(i, v+3, str(v), ha='center', fontsize=9)\n"
+    "plt.tight_layout(); plt.savefig(FIG/'eda_class_balance.png', dpi=130); plt.show()"
+))
+cells.append(code(
+    "# Labelled sample grid: 2 examples per class\n"
+    "import glob\n"
+    "fig,axes=plt.subplots(len(CLASS_NAMES),2,figsize=(4.5,1.9*len(CLASS_NAMES)))\n"
+    "for r,c in enumerate(CLASS_NAMES):\n"
+    "    files=sorted(glob.glob(str(RAW/c/'*.jpg')))[:2]\n"
+    "    for col in range(2):\n"
+    "        ax=axes[r][col]; ax.axis('off')\n"
+    "        if col<len(files): ax.imshow(Image.open(files[col]).convert('RGB')); \n"
+    "        if col==0: ax.set_title(c, loc='left', fontsize=10, fontweight='bold')\n"
+    "plt.tight_layout(); plt.savefig(FIG/'eda_sample_grid.png', dpi=130); plt.show()"
+))
+cells.append(code(
+    "# Image-size distribution (spread of source resolutions)\n"
+    "import glob\n"
+    "ws=[]; hs=[]\n"
+    "for c in CLASS_NAMES:\n"
+    "    for f in sorted(glob.glob(str(RAW/c/'*.jpg')))[:120]:\n"
+    "        try: w,h=Image.open(f).size; ws.append(w); hs.append(h)\n"
+    "        except Exception: pass\n"
+    "fig,ax=plt.subplots(figsize=(5,3.5)); ax.scatter(ws,hs,s=6,alpha=0.35,color='#157d8f')\n"
+    "ax.set_xlabel('width (px)'); ax.set_ylabel('height (px)'); ax.set_title('Source image sizes')\n"
+    "plt.tight_layout(); plt.savefig(FIG/'eda_image_sizes.png', dpi=130); plt.show()"
+))
+
+cells.append(md("## 3 · Build dataframe + stratified 70/15/15 split"))
+cells.append(code(
+    "import pandas as pd\n"
+    "from sklearn.model_selection import train_test_split\n"
+    "rows = [(str(p), c) for c in CLASS_NAMES for p in (RAW/c).glob('*.jpg')]\n"
+    "df = pd.DataFrame(rows, columns=['path','label'])\n"
+    "print(df.groupby('label').size().reindex(CLASS_NAMES))\n"
+    "tr, tmp = train_test_split(df, test_size=SPLIT[1]+SPLIT[2], stratify=df.label, random_state=SEED)\n"
+    "va, te = train_test_split(tmp, test_size=SPLIT[2]/(SPLIT[1]+SPLIT[2]), stratify=tmp.label, random_state=SEED)\n"
+    "print('train/val/test:', len(tr), len(va), len(te))"
+))
+
+cells.append(md(
+    "## 4 · Datasets & transforms\n"
+    "Train: RandomResizedCrop + RandAugment + flip + Random Erasing. Val/Test: **Resize(224) + "
+    "Normalize** — identical to the backend's `species.py` preprocessing, so metrics reflect deployment."
+))
+cells.append(code(
+    "from torch.utils.data import Dataset, DataLoader\n"
+    "import torchvision.transforms as T\n"
+    "LBL2I = {c:i for i,c in enumerate(CLASS_NAMES)}\n"
+    "train_tf = T.Compose([\n"
+    "    T.RandomResizedCrop(IMG_SIZE, scale=(0.6,1.0)), T.RandomHorizontalFlip(),\n"
+    "    T.RandAugment(num_ops=2, magnitude=7), T.ToTensor(),\n"
+    "    T.Normalize(IMAGENET_MEAN, IMAGENET_STD), T.RandomErasing(p=0.25),\n"
+    "])\n"
+    "eval_tf = T.Compose([T.Resize((IMG_SIZE,IMG_SIZE)), T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])\n"
+    "\n"
+    "class DS(Dataset):\n"
+    "    def __init__(self, frame, tf): self.f=frame.reset_index(drop=True); self.tf=tf\n"
+    "    def __len__(self): return len(self.f)\n"
+    "    def __getitem__(self, i):\n"
+    "        r=self.f.iloc[i]; img=Image.open(r.path).convert('RGB'); return self.tf(img), LBL2I[r.label]\n"
+    "\n"
+    "BATCH=64\n"
+    "# Class-balanced sampling: draw each class equally often so the model isn't skewed toward the\n"
+    "# larger classes (e.g. Dog) - uses ALL images rather than hard-capping to the smallest class.\n"
+    "from torch.utils.data import WeightedRandomSampler\n"
+    "cw = tr['label'].value_counts().to_dict()\n"
+    "sample_w = tr['label'].map(lambda c: 1.0/cw[c]).to_numpy()\n"
+    "sampler = WeightedRandomSampler(torch.as_tensor(sample_w, dtype=torch.double), num_samples=len(tr), replacement=True)\n"
+    "dl_tr=DataLoader(DS(tr,train_tf),batch_size=BATCH,sampler=sampler,num_workers=2,pin_memory=True,drop_last=True)\n"
+    "dl_va=DataLoader(DS(va,eval_tf),batch_size=BATCH,num_workers=2,pin_memory=True)\n"
+    "dl_te=DataLoader(DS(te,eval_tf),batch_size=BATCH,num_workers=2,pin_memory=True)"
+))
+
+cells.append(md("## 5 · Model factory + MixUp/CutMix + EMA"))
+cells.append(code(
+    "import torch.nn as nn, torchvision.models as M, copy\n"
+    "def build(name):\n"
+    "    if name=='efficientnet_v2_s':\n"
+    "        m=M.efficientnet_v2_s(weights='IMAGENET1K_V1'); m.classifier[1]=nn.Linear(m.classifier[1].in_features,5)\n"
+    "    elif name=='convnext_tiny':\n"
+    "        m=M.convnext_tiny(weights='IMAGENET1K_V1'); m.classifier[2]=nn.Linear(m.classifier[2].in_features,5)\n"
+    "    elif name=='efficientnet_b0':\n"
+    "        m=M.efficientnet_b0(weights='IMAGENET1K_V1'); m.classifier[1]=nn.Linear(m.classifier[1].in_features,5)\n"
+    "    else: raise ValueError(name)\n"
+    "    return m\n"
+    "\n"
+    "from torchvision.transforms import v2\n"
+    "mixup = v2.MixUp(num_classes=5, alpha=0.2); cutmix = v2.CutMix(num_classes=5, alpha=1.0)\n"
+    "def mix(x,y):\n"
+    "    return (cutmix if random.random()<0.5 else mixup)(x,y)\n"
+    "\n"
+    "class EMA:\n"
+    "    def __init__(self, model, decay=0.999):\n"
+    "        self.decay=decay; self.shadow=copy.deepcopy(model).eval()\n"
+    "        for p in self.shadow.parameters(): p.requires_grad_(False)\n"
+    "    @torch.no_grad()\n"
+    "    def update(self, model):\n"
+    "        for s,p in zip(self.shadow.parameters(), model.parameters()): s.mul_(self.decay).add_(p, alpha=1-self.decay)\n"
+    "        for s,p in zip(self.shadow.buffers(), model.buffers()): s.copy_(p)"
+))
+
+cells.append(md("## 6 · Training loop (AMP · cosine · label smoothing · MixUp/CutMix · EMA · best macro-F1)"))
+cells.append(code(
+    "from sklearn.metrics import f1_score\n"
+    "@torch.no_grad()\n"
+    "def evaluate(model, dl):\n"
+    "    model.eval(); ys=[]; ps=[]\n"
+    "    for x,y in dl:\n"
+    "        x=x.to(DEVICE); out=model(x).argmax(1).cpu(); ys+=y.tolist(); ps+=out.tolist()\n"
+    "    return f1_score(ys, ps, average='macro'), ys, ps\n"
+    "\n"
+    "def train_model(name, epochs=12, lr=3e-4, wd=0.05, label_smooth=0.1):\n"
+    "    set_seed()\n"
+    "    model=build(name).to(DEVICE); ema=EMA(model)\n"
+    "    opt=torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)\n"
+    "    sched=torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(dl_tr))\n"
+    "    lossf=nn.CrossEntropyLoss(label_smoothing=label_smooth)\n"
+    "    scaler=torch.cuda.amp.GradScaler(enabled=DEVICE=='cuda')\n"
+    "    best=-1; best_state=None; hist={'val_f1':[], 'train_loss':[]}\n"
+    "    for ep in range(epochs):\n"
+    "        model.train(); running=0.0; nb=0\n"
+    "        for x,y in dl_tr:\n"
+    "            x=x.to(DEVICE); y=y.to(DEVICE); x,y=mix(x,y)\n"
+    "            opt.zero_grad()\n"
+    "            with torch.cuda.amp.autocast(enabled=DEVICE=='cuda'):\n"
+    "                loss=lossf(model(x), y)\n"
+    "            scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sched.step(); ema.update(model)\n"
+    "            running+=float(loss.item()); nb+=1\n"
+    "        f1,_,_=evaluate(ema.shadow, dl_va)\n"
+    "        hist['val_f1'].append(f1); hist['train_loss'].append(running/max(nb,1))\n"
+    "        print(f'{name} ep{ep+1}/{epochs} val_macroF1={f1:.4f}')\n"
+    "        if f1>best: best=f1; best_state=copy.deepcopy(ema.shadow.state_dict())\n"
+    "    model.load_state_dict(best_state); model.eval()\n"
+    "    return model, best, hist"
+))
+
+cells.append(md("## 7 · Train & compare candidate architectures"))
+cells.append(code(
+    "results={}\n"
+    "for name in ['efficientnet_v2_s','convnext_tiny']:   # add 'efficientnet_b0' for the baseline\n"
+    "    m,f1,hist=train_model(name, epochs=15)\n"
+    "    tef1,_,_=evaluate(m, dl_te)\n"
+    "    results[name]={'model':m,'val_f1':f1,'test_f1':tef1,'hist':hist}\n"
+    "    print(f'==> {name}: val {f1:.4f} | test {tef1:.4f}')\n"
+    "best_name=max(results, key=lambda k: results[k]['val_f1']); best_model=results[best_name]['model']\n"
+    "print('BEST:', best_name)"
+))
+
+cells.append(md("## 8 · Full evaluation (report · confusion matrix · ROC-AUC · PR)"))
+cells.append(code(
+    "import numpy as np, seaborn as sns, matplotlib.pyplot as plt\n"
+    "from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score\n"
+    "@torch.no_grad()\n"
+    "def logits_on(model, dl):\n"
+    "    model.eval(); L=[]; Y=[]\n"
+    "    for x,y in dl:\n"
+    "        L.append(model(x.to(DEVICE)).cpu().numpy()); Y+=y.tolist()\n"
+    "    return np.concatenate(L), np.array(Y)\n"
+    "logits, y_true = logits_on(best_model, dl_te)\n"
+    "prob = torch.softmax(torch.tensor(logits),1).numpy(); y_pred = prob.argmax(1)\n"
+    "print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=3))\n"
+    "acc=accuracy_score(y_true,y_pred); macro_f1=f1_score(y_true,y_pred,average='macro')\n"
+    "try: auc=roc_auc_score(np.eye(5)[y_true], prob, average='macro', multi_class='ovr')\n"
+    "except Exception: auc=float('nan')\n"
+    "print(f'accuracy={acc:.4f}  macro-F1={macro_f1:.4f}  macro ROC-AUC={auc:.4f}')\n"
+    "cm=confusion_matrix(y_true,y_pred)\n"
+    "plt.figure(figsize=(5,4)); sns.heatmap(cm,annot=True,fmt='d',cmap='Greens',xticklabels=CLASS_NAMES,yticklabels=CLASS_NAMES)\n"
+    "plt.xlabel('predicted'); plt.ylabel('true'); plt.title(f'{best_name} confusion'); plt.show()"
+))
+
+cells.append(md("## 9 · Temperature-scaling calibration (ECE before/after)"))
+cells.append(code(
+    "vlog, vy = logits_on(best_model, dl_va)\n"
+    "def ece(probs, labels, bins=15):\n"
+    "    conf=probs.max(1); pred=probs.argmax(1); acc=(pred==labels).astype(float); e=0.0\n"
+    "    for i in range(bins):\n"
+    "        lo,hi=i/bins,(i+1)/bins; m=(conf>lo)&(conf<=hi)\n"
+    "        if m.sum()>0: e+=abs(acc[m].mean()-conf[m].mean())*m.mean()\n"
+    "    return float(e)\n"
+    "import torch.nn.functional as F\n"
+    "logit_t=torch.tensor(vlog, dtype=torch.float32); y_t=torch.tensor(vy)\n"
+    "# Optimise over LOG-temperature so T = exp(logT) is ALWAYS positive (a negative T would\n"
+    "# invert the logits and break inference).\n"
+    "logT=torch.nn.Parameter(torch.zeros(1)); opt=torch.optim.LBFGS([logT],lr=0.05,max_iter=80)\n"
+    "def closure(): opt.zero_grad(); l=F.cross_entropy(logit_t/logT.exp(), y_t); l.backward(); return l\n"
+    "opt.step(closure); T_opt=float(logT.exp().detach().item())\n"
+    "p_before=torch.softmax(torch.tensor(logits,dtype=torch.float32),1).numpy()\n"
+    "p_after=torch.softmax(torch.tensor(logits,dtype=torch.float32)/T_opt,1).numpy()\n"
+    "ece_b=ece(p_before,y_true); ece_a=ece(p_after,y_true)\n"
+    "# Safety: fall back to T=1.0 if the fit is degenerate or made calibration worse.\n"
+    "if not (0.3 <= T_opt <= 6.0) or ece_a > ece_b + 1e-4:\n"
+    "    print(f'calibration fit rejected (T={T_opt:.3f}); using T=1.0'); T_opt=1.0; ece_a=ece_b\n"
+    "print(f'Temperature T={T_opt:.4f}  ECE {ece_b:.4f} -> {ece_a:.4f}')"
+))
+
+cells.append(md(
+    "## 9b · Model visualisations (saved to `figures/` for the report)\n"
+    "Training curves, backbone comparison, normalized confusion, per-class F1, ROC, the "
+    "confidence distribution + reliability diagram (illustrating why a sharpening temperature is "
+    "needed), and a qualitative sample-predictions grid."
+))
+cells.append(code(
+    "import numpy as np, matplotlib.pyplot as plt\n"
+    "# training curves (val macro-F1 per epoch) + backbone comparison\n"
+    "fig,ax=plt.subplots(figsize=(6,3.6))\n"
+    "for name,r in results.items(): ax.plot(range(1,len(r['hist']['val_f1'])+1), r['hist']['val_f1'], marker='o', label=name)\n"
+    "ax.set_xlabel('epoch'); ax.set_ylabel('val macro-F1'); ax.set_title('Training curves'); ax.legend(); ax.grid(alpha=0.3)\n"
+    "plt.tight_layout(); plt.savefig(FIG/'training_curves.png',dpi=130); plt.show()\n"
+    "names=list(results); vals=[results[n]['test_f1'] for n in names]\n"
+    "fig,ax=plt.subplots(figsize=(5,3.2)); ax.bar(names, vals, color=['#8a63d2','#157d8f']); ax.set_ylim(0,1)\n"
+    "ax.set_title('Test macro-F1 by backbone')\n"
+    "for i,v in enumerate(vals): ax.text(i, v+0.01, f'{v:.3f}', ha='center')\n"
+    "plt.tight_layout(); plt.savefig(FIG/'model_comparison.png',dpi=130); plt.show()"
+))
+cells.append(code(
+    "from sklearn.metrics import confusion_matrix, f1_score\n"
+    "import seaborn as sns\n"
+    "cmn=confusion_matrix(y_true,y_pred,normalize='true')\n"
+    "fig,ax=plt.subplots(figsize=(5,4)); sns.heatmap(cmn,annot=True,fmt='.2f',cmap='Greens',xticklabels=CLASS_NAMES,yticklabels=CLASS_NAMES,ax=ax)\n"
+    "ax.set_xlabel('predicted'); ax.set_ylabel('true'); ax.set_title('Normalized confusion matrix')\n"
+    "plt.tight_layout(); plt.savefig(FIG/'confusion_normalized.png',dpi=130); plt.show()\n"
+    "per=[f1_score((y_true==i).astype(int),(y_pred==i).astype(int)) for i in range(len(CLASS_NAMES))]\n"
+    "fig,ax=plt.subplots(figsize=(5.5,3)); ax.bar(CLASS_NAMES, per, color='#157d8f'); ax.set_ylim(0,1); ax.set_title('Per-class F1')\n"
+    "for i,v in enumerate(per): ax.text(i,v+0.01,f'{v:.2f}',ha='center')\n"
+    "plt.tight_layout(); plt.savefig(FIG/'per_class_f1.png',dpi=130); plt.show()"
+))
+cells.append(code(
+    "from sklearn.metrics import roc_curve, auc\n"
+    "Yb=np.eye(len(CLASS_NAMES))[y_true]\n"
+    "fig,ax=plt.subplots(figsize=(5,4))\n"
+    "for i,c in enumerate(CLASS_NAMES):\n"
+    "    fpr,tpr,_=roc_curve(Yb[:,i], prob[:,i]); ax.plot(fpr,tpr,label=f'{c} (AUC {auc(fpr,tpr):.3f})')\n"
+    "ax.plot([0,1],[0,1],'--',color='gray'); ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.set_title('ROC (one-vs-rest)'); ax.legend(fontsize=8)\n"
+    "plt.tight_layout(); plt.savefig(FIG/'roc_curves.png',dpi=130); plt.show()"
+))
+cells.append(code(
+    "import torch\n"
+    "p1=torch.softmax(torch.tensor(logits,dtype=torch.float32),1).numpy()\n"
+    "pt=torch.softmax(torch.tensor(logits,dtype=torch.float32)/T_opt,1).numpy()\n"
+    "fig,ax=plt.subplots(figsize=(5.5,3.2))\n"
+    "ax.hist(p1.max(1),bins=20,alpha=0.5,label='T=1 (raw)',color='#b5651d')\n"
+    "ax.hist(pt.max(1),bins=20,alpha=0.5,label=f'T={T_opt:.2f} (calibrated)',color='#157d8f')\n"
+    "ax.axvline(0.70,ls='--',color='red',label='Unverified threshold'); ax.set_xlabel('max softmax confidence'); ax.set_title('Confidence distribution'); ax.legend(fontsize=8)\n"
+    "plt.tight_layout(); plt.savefig(FIG/'confidence_hist.png',dpi=130); plt.show()\n"
+    "def rel(probs,labels,bins=10):\n"
+    "    conf=probs.max(1); pred=probs.argmax(1); acc=(pred==labels).astype(float); xs=[]; ys=[]\n"
+    "    for i in range(bins):\n"
+    "        lo,hi=i/bins,(i+1)/bins; m=(conf>lo)&(conf<=hi)\n"
+    "        if m.sum()>0: xs.append(conf[m].mean()); ys.append(acc[m].mean())\n"
+    "    return xs,ys\n"
+    "fig,ax=plt.subplots(figsize=(4.2,4)); ax.plot([0,1],[0,1],'--',color='gray')\n"
+    "x1,y1=rel(p1,y_true); xt,yt=rel(pt,y_true)\n"
+    "ax.plot(x1,y1,marker='o',label='T=1',color='#b5651d'); ax.plot(xt,yt,marker='o',label=f'T={T_opt:.2f}',color='#157d8f')\n"
+    "ax.set_xlabel('confidence'); ax.set_ylabel('accuracy'); ax.set_title('Reliability diagram'); ax.legend()\n"
+    "plt.tight_layout(); plt.savefig(FIG/'reliability.png',dpi=130); plt.show()"
+))
+cells.append(code(
+    "from PIL import Image\n"
+    "te2=te.reset_index(drop=True)\n"
+    "wrong=[i for i in range(len(y_true)) if y_pred[i]!=y_true[i]][:4]\n"
+    "right=[i for i in range(len(y_true)) if y_pred[i]==y_true[i]][:4]\n"
+    "idxs=right+wrong\n"
+    "fig,axes=plt.subplots(2,4,figsize=(11,5.5))\n"
+    "for ax,i in zip(axes.ravel(), idxs):\n"
+    "    ax.axis('off'); ax.imshow(Image.open(te2.iloc[i].path).convert('RGB'))\n"
+    "    ok=y_pred[i]==y_true[i]; col='green' if ok else 'red'\n"
+    "    ax.set_title(f'true {CLASS_NAMES[y_true[i]]}\\npred {CLASS_NAMES[y_pred[i]]} ({prob[i].max():.2f})', color=col, fontsize=9)\n"
+    "plt.suptitle('Sample predictions (top row correct, bottom row misclassified)'); plt.tight_layout()\n"
+    "plt.savefig(FIG/'sample_predictions.png',dpi=130); plt.show()\n"
+    "print('saved figures:', sorted(p.name for p in FIG.glob('*.png')))"
+))
+
+cells.append(md("## 10 · (Optional) Optuna hyper-parameter search\nA short study over LR / weight-decay / label-smoothing on the best backbone. Increase `n_trials` on an A100."))
+cells.append(code(
+    "import optuna\n"
+    "def objective(trial):\n"
+    "    lr=trial.suggest_float('lr',1e-4,1e-3,log=True); wd=trial.suggest_float('wd',1e-3,1e-1,log=True)\n"
+    "    ls=trial.suggest_float('label_smooth',0.0,0.2)\n"
+    "    _,f1=train_model(best_name, epochs=5, lr=lr, wd=wd, label_smooth=ls); return f1\n"
+    "# study=optuna.create_study(direction='maximize'); study.optimize(objective, n_trials=8)\n"
+    "# print('best params:', study.best_params, 'val F1', study.best_value)\n"
+    "print('Uncomment to run the search (each trial trains a short model).')"
+))
+
+cells.append(md(
+    "## 11 · Export → `species_model.onnx` + `labels.json` + `calibration.json` + `metrics.json`\n"
+    "The ONNX outputs **logits**; the backend applies softmax with the calibrated temperature "
+    "(matching `backend/app/ml/species.py`)."
+))
+cells.append(code(
+    "import json\n"
+    "best_model.eval().cpu()\n"
+    "dummy=torch.randn(1,3,IMG_SIZE,IMG_SIZE)\n"
+    "torch.onnx.export(best_model, dummy, str(EXPORT/'species_model.onnx'), input_names=['input'],\n"
+    "    output_names=['logits'], dynamic_axes={'input':{0:'N'},'logits':{0:'N'}}, opset_version=17)\n"
+    "json.dump(CLASS_NAMES, open(EXPORT/'labels.json','w'))\n"
+    "json.dump({'temperature':round(T_opt,4),'ece_before':round(ece_b,4),'ece_after':round(ece_a,4)}, open(EXPORT/'calibration.json','w'))\n"
+    "json.dump({'backbone':best_name,'accuracy':round(float(acc),4),'macro_f1':round(float(macro_f1),4),\n"
+    "           'macro_roc_auc':round(float(auc),4),'per_backbone':{k:{'val_f1':round(v['val_f1'],4),'test_f1':round(v['test_f1'],4)} for k,v in results.items()},\n"
+    "           'classes':CLASS_NAMES,'img_size':IMG_SIZE,'seed':SEED}, open(EXPORT/'metrics.json','w'), indent=2)\n"
+    "print('wrote', [p.name for p in EXPORT.iterdir()])"
+))
+cells.append(code(
+    "# --- sanity check: run the ONNX exactly like the backend does -------------\n"
+    "import onnxruntime as ort, numpy as np\n"
+    "sess=ort.InferenceSession(str(EXPORT/'species_model.onnx'), providers=['CPUExecutionProvider'])\n"
+    "def backend_preprocess(pil):\n"
+    "    im=pil.convert('RGB').resize((IMG_SIZE,IMG_SIZE)); a=np.asarray(im,dtype=np.float32)/255.0\n"
+    "    a=(a-np.array(IMAGENET_MEAN,dtype=np.float32))/np.array(IMAGENET_STD,dtype=np.float32)\n"
+    "    return a.transpose(2,0,1)[None].astype(np.float32)\n"
+    "sample=Image.open(te.iloc[0].path)\n"
+    "lg=sess.run(None,{'input':backend_preprocess(sample)})[0][0]\n"
+    "pr=torch.softmax(torch.tensor(lg)/T_opt,0).numpy()\n"
+    "print('true:', te.iloc[0].label, '| pred:', CLASS_NAMES[int(pr.argmax())], '| conf:', round(float(pr.max()),3))"
+))
+cells.append(code(
+    "# --- download the artefacts, then drop them into ml/exported/ in the repo ---\n"
+    "import shutil\n"
+    "shutil.make_archive('safetails_species_export','zip', EXPORT)\n"
+    "try:\n"
+    "    from google.colab import files; files.download('safetails_species_export.zip')\n"
+    "except Exception: print('Not on Colab - find safetails_species_export.zip in the working dir.')"
+))
+cells.append(md(
+    "### Integrating the new model\n"
+    "1. Unzip into `ml/exported/` (overwrite `species_model.onnx`, `labels.json`, `calibration.json`, `metrics.json`).\n"
+    "2. Set `SPECIES_TEMPERATURE` in `.env` to the printed **T** (from calibration).\n"
+    "3. Restart the backend. `backend/app/ml/species.py` already loads this exact format — no code change needed.\n"
+    "4. If you changed the class list, update `CLASS_NAMES` in `backend/app/ml/species.py` and the frontend `SPECIES` map (kept at 5 here, so no change)."
+))
+
+nb.cells = cells
+nb.metadata = {"kernelspec": {"name": "python3", "display_name": "Python 3"},
+               "accelerator": "GPU", "colab": {"provenance": []}}
+out = NB / "03_colab_train_species.ipynb"
+nbf.write(nb, str(out))
+print("wrote", out, "with", len(cells), "cells")
