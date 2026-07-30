@@ -1,5 +1,6 @@
 """Location generalisation is privacy-critical and deterministic - test it directly."""
 from app.utils.geo import generalise_location, resolve_ward
+from app.utils.kathmandu_areas import KATHMANDU_AREAS
 
 
 def test_generalisation_snaps_nearby_points_together():
@@ -23,15 +24,20 @@ def test_generalisation_moves_point_at_most_grid_distance():
     assert abs(glng - lng) < 0.001
 
 
-def test_resolve_ward_falls_back_to_nearest_area_without_polygons():
+def test_resolve_ward_falls_back_to_nearest_area_without_local_data(tmp_path, monkeypatch):
     """Without ward polygons the resolver must still name an area.
 
     Regression test: it previously returned None whenever the (never-created) ward GeoJSON was
     absent, so every report submitted through the app was stored with no area at all and could
     not be selected by the client's area filter.
     """
-    assert resolve_ward(27.6470, 85.3030, geojson_path="data/does_not_exist.geojson") == "Bhaisepati"
-    assert resolve_ward(27.7154, 85.3110, geojson_path="data/does_not_exist.geojson") == "Thamel"
+    import app.utils.geo as geo
+
+    monkeypatch.setattr(geo, "BASE_DIR", tmp_path)
+    geo._load_areas.cache_clear()
+    geo._load_ward_polygons.cache_clear()
+    assert resolve_ward(27.6470, 85.3030) == "Bhaisepati"
+    assert resolve_ward(27.7154, 85.3110) == "Thamel"
 
 
 def test_resolve_ward_is_stable_under_generalisation():
@@ -58,11 +64,6 @@ def test_resolve_ward_none_when_no_reference_data_at_all():
 def test_resolved_areas_are_all_selectable_in_the_client_filter():
     """Every name the backend can assign must exist in the canonical list the client offers,
     otherwise a report is stored under a name no filter can select."""
-    import json
-
-    from app.core.config import BASE_DIR
-
-    canonical = {a["name"] for a in json.loads(
-        (BASE_DIR / "data/kathmandu_areas.json").read_text(encoding="utf-8"))}
+    canonical = {name for name, _lng, _lat in KATHMANDU_AREAS}
     for lat, lng in [(27.6470, 85.3030), (27.7154, 85.3110), (27.6780, 85.3490), (27.6727, 85.3250)]:
         assert resolve_ward(lat, lng) in canonical
