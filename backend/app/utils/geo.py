@@ -15,8 +15,10 @@ from functools import lru_cache
 from pathlib import Path
 
 from app.core.config import BASE_DIR
+from app.utils.kathmandu_areas import KATHMANDU_AREAS
 
 _METERS_PER_DEG_LAT = 111_320.0
+_DEFAULT_AREAS_PATH = "data/kathmandu_areas.json"
 
 # A point further than this from every known area centroid is outside the served region; we
 # return None rather than snapping it onto an unrelated neighbourhood.
@@ -42,10 +44,10 @@ def _abs_path(p: str) -> Path:
 
 @lru_cache(maxsize=1)
 def _load_areas(areas_path: str) -> tuple[tuple[str, float, float], ...]:
-    """Canonical (name, lng, lat) centroids. Empty tuple if the file is missing."""
+    """Canonical (name, lng, lat) centroids with a source-backed default catalog."""
     path = _abs_path(areas_path)
     if not path.exists():
-        return ()
+        return KATHMANDU_AREAS if areas_path == _DEFAULT_AREAS_PATH else ()
     data = json.loads(path.read_text(encoding="utf-8"))
     return tuple((str(a["name"]), float(a["lng"]), float(a["lat"])) for a in data if a.get("name"))
 
@@ -80,7 +82,7 @@ def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 def nearest_area(
     lat: float,
     lng: float,
-    areas_path: str = "data/kathmandu_areas.json",
+    areas_path: str = _DEFAULT_AREAS_PATH,
     max_km: float = _MAX_SNAP_KM,
 ) -> str | None:
     """Nearest canonical area by great-circle distance, or None if nothing is within max_km.
@@ -103,7 +105,7 @@ def resolve_ward(
     lat: float,
     lng: float,
     geojson_path: str = "data/kathmandu_wards.geojson",
-    areas_path: str = "data/kathmandu_areas.json",
+    areas_path: str = _DEFAULT_AREAS_PATH,
 ) -> str | None:
     """Resolve a coordinate to an area name.
 
